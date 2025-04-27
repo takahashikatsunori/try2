@@ -1,7 +1,7 @@
 import json
 import csv
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 def extract_status_counts(json_file_path, output_csv_path):
@@ -38,10 +38,10 @@ def extract_status_counts(json_file_path, output_csv_path):
 
     # 最も古い作成日を特定
     start_date = min(ticket['created'] for ticket in ticket_histories if ticket['created'])
-    start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_date = start_date.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
     # 今日の日付を取得
-    end_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    end_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
     # 期間内の日付ごとにステータス集計
     date = start_date
