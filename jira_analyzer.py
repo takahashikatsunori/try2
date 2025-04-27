@@ -4,93 +4,100 @@ import argparse
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
+def parse_iso(dt_str):
+    # ISOフォーマットをパースしてUTC対応のdatetimeを返す
+    if not dt_str:
+        return None
+    if dt_str.endswith('Z'):
+        return datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+    return datetime.fromisoformat(dt_str)
+
 def extract_status_counts(json_file_path, output_csv_path):
-    # JSONファイルを読み込む
+    # JSONファイル読み込み
     with open(json_file_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-
     issues = data.get('issues', [])
-    ticket_histories = []
 
+    # チケットごとのステータス変更イベントを収集
+    ticket_events = {}
     for issue in issues:
         key = issue.get('key', '')
         fields = issue.get('fields', {})
-        created = fields.get('created', '')
-        created_dt = datetime.fromisoformat(created.replace('Z', '+00:00')) if created else None
-
-        # チケットの初期ステータスを取得
-        initial_status = fields.get('status', {}).get('name', '')
-        status_changes = []
-        if created_dt and initial_status:
-            status_changes.append((created_dt, initial_status))
-
-        # ステータス変更履歴を取得
+        created_dt = parse_iso(fields.get('created', ''))
         histories = fields.get('changelog', {}).get('histories', [])
-        for history in histories:
-            history_created = history.get('created', '')
-            history_dt = datetime.fromisoformat(history_created.replace('Z', '+00:00')) if history_created else None
-            for item in history.get('items', []):
+
+        events = []
+        # 初期ステータス: changelogにfromStringなしの最初のステータス変更があればそれを初期とする
+        initial_found = False
+        for hist in histories:
+            for item in hist.get('items', []):
+                if item.get('field') == 'status' and not item.get('fromString'):
+                    dt = parse_iso(hist.get('created'))
+                    events.append((dt, item.get('toString', '')))
+                    initial_found = True
+                    break
+            if initial_found:
+                break
+        # changelogに初期がなければ、作成時点のステータスを使用
+        if not initial_found and created_dt:
+            init_status = fields.get('status', {}).get('name', '')
+            events.append((created_dt, init_status))
+
+        # 以降のステータス変更をすべて追加
+        for hist in histories:
+            dt = parse_iso(hist.get('created'))
+            for item in hist.get('items', []):
                 if item.get('field') == 'status':
-                    to_status = item.get('toString', '')
-                    if history_dt:
-                        status_changes.append((history_dt, to_status))
+                    events.append((dt, item.get('toString', '')))
 
-        # 日付順にソート
-        status_changes.sort(key=lambda x: x[0])
-        ticket_histories.append({
-            'key': key,
-            'created': created_dt,
-            'status_changes': status_changes
-        })
+        # イベントを時系列でソート
+        events = [(dt.astimezone(timezone.utc), st) for dt, st in events if dt]
+        events.sort(key=lambda x: x[0])
+        ticket_events[key] = events
 
-    # 最も古い作成日を特定（UTC 0時開始）
-    start_date = min(t['created'] for t in ticket_histories if t['created'])
-    start_date = start_date.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-
-    # 今日の日付（UTC 0時）
+    # 集計期間の設定（最古のイベント日時を開始日、今日を終了日）
+    all_dates = [events[0][0] for events in ticket_events.values() if events]
+    if not all_dates:
+        print("有効なステータスイベントが見つかりませんでした。")
+        return
+    start_date = min(all_dates).replace(hour=0, minute=0, second=0, microsecond=0)
     end_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # 期間内の日ごとのステータス集計
+    # 日付ごとステータス数集計
     date = start_date
     date_status_counts = {}
     while date <= end_date:
-        status_count = defaultdict(int)
-        for ticket in ticket_histories:
-            # チケットがまだ作成されていない日はスキップ
-            if not ticket['created'] or ticket['created'] > date:
-                continue
-
-            # 最終ステータスを特定
-            current_status = None
-            for change_date, status in ticket['status_changes']:
-                if change_date <= date:
-                    current_status = status
+        counts = defaultdict(int)
+        for key, events in ticket_events.items():
+            # 当日0時時点でのステータスを取得
+            current = None
+            for dt, status in events:
+                if dt <= date:
+                    current = status
                 else:
                     break
-
-            if current_status:
-                status_count[current_status] += 1
-
-        date_status_counts[date.strftime('%Y-%m-%d')] = dict(status_count)
+            if current:
+                counts[current] += 1
+        date_str = date.strftime('%Y-%m-%d')
+        date_status_counts[date_str] = counts
         date += timedelta(days=1)
 
-    # 全ステータス列を収集しソート
+    # CSVヘッダー用ステータスの総集合
     all_statuses = sorted({s for counts in date_status_counts.values() for s in counts})
 
-    # CSVに書き出し
+    # CSV出力
     with open(output_csv_path, 'w', newline='', encoding='utf-8') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow(['Date'] + all_statuses)
-        for d, counts in date_status_counts.items():
-            row = [d] + [counts.get(status, 0) for status in all_statuses]
+        for date_str, counts in date_status_counts.items():
+            row = [date_str] + [counts.get(s, 0) for s in all_statuses]
             writer.writerow(row)
 
-    print(f"ステータス統計を{output_csv_path}に出力しました。")
+    print(f"ステータス統計を {output_csv_path} に出力しました。")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Extract JIRA ticket status counts from JSON to CSV.')
     parser.add_argument('input_json', nargs='?', default='output.json', help='Input JSON file path (default: output.json)')
     parser.add_argument('output_csv', nargs='?', default='output.csv', help='Output CSV file path (default: output.csv)')
     args = parser.parse_args()
-
     extract_status_counts(args.input_json, args.output_csv)
