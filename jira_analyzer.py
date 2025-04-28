@@ -16,34 +16,36 @@ def parse_iso(dt_str):
         return datetime.fromisoformat(base)
 
 def extract_field_counts(json_path, field_id, debug=False):
-    # 出力ファイル名を固定
+    # 出力ファイル名
     csv_path = f"stat_{field_id}.csv"
 
     # JSON読み込み
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     issues = data.get('issues', [])
-    ticket_events = {}
 
+    # チケットごとにイベントリストを構築
+    ticket_events = {}
     for issue in issues:
         key = issue.get('key')
         fields = issue.get('fields', {})
         created_dt = parse_iso(fields.get('created', ''))
 
-        # 初期値取得
+        # 初期値
         if field_id == 'status':
             init_val = fields.get('status', {}).get('name')
         else:
             raw = fields.get(field_id)
-            if isinstance(raw, dict) and raw is not None:
+            init_val = None
+            if isinstance(raw, dict):
                 init_val = raw.get('value') or raw.get('name')
-            else:
+            elif raw is not None:
                 init_val = raw
         events = []
         if created_dt and init_val is not None:
             events.append((created_dt.astimezone(timezone.utc), init_val))
 
-        # 履歴からfield_idの変更を抽出
+        # changelogからの変更イベント
         for hist in fields.get('changelog', {}).get('histories', []):
             dt = parse_iso(hist.get('created', ''))
             if not dt:
@@ -51,64 +53,73 @@ def extract_field_counts(json_path, field_id, debug=False):
             dt = dt.astimezone(timezone.utc)
             for item in hist.get('items', []):
                 if item.get('field') == field_id:
-                    val = item.get('toString')
-                    events.append((dt, val))
+                    events.append((dt, item.get('toString')))
 
-        # ソートして保存
+        # ソート
         events.sort(key=lambda x: x[0])
         ticket_events[key] = events
 
-    # デバッグ: 各チケットのイベント数
-    if debug:
-        print(f"[DEBUG] Field '{field_id}' events per ticket:")
-        for key, evs in ticket_events.items():
-            print(f"  {key}: {len(evs)} events -> {[v for _,v in evs]}")
+    # チケットごとに日付→ステータスマップを作成
+    ticket_date_map = {}
+    for key, events in ticket_events.items():
+        date_map = {}
+        for dt, val in events:
+            date_map[dt.date()] = val
+        ticket_date_map[key] = date_map
 
-    # 集計期間算出
-    all_dt = [ev[0] for evs in ticket_events.values() for ev in evs]
-    if not all_dt:
-        print("指定フィールドのイベントが見つかりませんでした。JSONに changelog が含まれているか確認してください。")
+    if debug:
+        print("[DEBUG] ticket_date_map:")
+        for key, dm in ticket_date_map.items():
+            print(f"  {key}: {dm}")
+
+    # 集計期間
+    all_dates = set()
+    for dm in ticket_date_map.values():
+        all_dates.update(dm.keys())
+    if not all_dates:
+        print("イベントが見つかりませんでした。JSONに changelog を含めて取得してください。")
         return
-    start = min(all_dt).replace(hour=0, minute=0, second=0, microsecond=0)
-    end = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    start = min(all_dates)
+    end = datetime.now(timezone.utc).date()
+
+    # 各チケットの前日のステータス保持用
+    last_status = {key: None for key in ticket_date_map}
 
     # 日毎集計
-    date = start
     date_counts = {}
-    while date <= end:
+    current = start
+    while current <= end:
         counts = defaultdict(int)
         if debug:
-            print(f"[DEBUG] Snapshot {date.date()}")
-        for key, evs in ticket_events.items():
-            current = None
-            for dt, val in evs:
-                if dt <= date:
-                    current = val
-                else:
-                    break
+            print(f"[DEBUG] Snapshot for {current}")
+        for key, dm in ticket_date_map.items():
+            # その日のイベントがあれば更新
+            if current in dm:
+                last_status[key] = dm[current]
+            status = last_status[key]
             if debug:
-                print(f"  {key} at {date.date()}: {current}")
-            if current is not None:
-                counts[current] += 1
-        date_counts[date.strftime('%Y-%m-%d')] = counts
-        date += timedelta(days=1)
+                print(f"  {key} at {current}: {status}")
+            if status is not None:
+                counts[status] += 1
+        date_counts[current.strftime('%Y-%m-%d')] = counts
+        current += timedelta(days=1)
 
-    # ヘッダー収集
+    # ヘッダー
     all_vals = sorted({v for cnts in date_counts.values() for v in cnts})
 
     # CSV出力
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(['Date'] + all_vals)
-        for date_str, cnts in date_counts.items():
-            writer.writerow([date_str] + [cnts.get(v, 0) for v in all_vals])
+        for d, cnts in date_counts.items():
+            writer.writerow([d] + [cnts.get(v, 0) for v in all_vals])
 
     print(f"統計結果を {csv_path} に出力しました。")
 
 if __name__ == '__main__':
-    p = argparse.ArgumentParser(description='JIRA JSONから日毎カスタムフィールド集計CSVを生成')
-    p.add_argument('input_json', nargs='?', default='output.json', help='入力JSONファイル (default: output.json)')
-    p.add_argument('field_id', nargs='?', default='status', help='統計を取るフィールドID (例: status or customfield_10010)')
-    p.add_argument('--debug', action='store_true', help='デバッグログ表示')
-    args = p.parse_args()
+    parser = argparse.ArgumentParser(description='JIRA JSONから日毎カスタムフィールド集計CSVを生成')
+    parser.add_argument('input_json', nargs='?', default='output.json', help='入力JSONファイル (default: output.json)')
+    parser.add_argument('field_id', nargs='?', default='status', help='統計を取るフィールドID (例: status or customfield_10010)')
+    parser.add_argument('--debug', action='store_true', help='デバッグログ表示')
+    args = parser.parse_args()
     extract_field_counts(args.input_json, args.field_id, debug=args.debug)
