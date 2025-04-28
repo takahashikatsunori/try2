@@ -1,10 +1,11 @@
 import json
 import csv
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, time, timedelta, timezone
 from collections import defaultdict
 
 def parse_iso(dt_str):
+    """ISO文字列をdatetimeに変換し、UTCタイムゾーンを設定する"""
     if not dt_str:
         return None
     try:
@@ -16,7 +17,7 @@ def parse_iso(dt_str):
         return datetime.fromisoformat(base)
 
 def extract_field_counts(json_path, field_id, debug=False):
-    # 出力ファイル名
+    # 出力先ファイル名
     csv_path = f"stat_{field_id}.csv"
 
     # JSON読み込み
@@ -24,87 +25,74 @@ def extract_field_counts(json_path, field_id, debug=False):
         data = json.load(f)
     issues = data.get('issues', [])
 
-    # チケットごとにイベントリストを構築
+    # チケットごとの時系列イベント
     ticket_events = {}
     for issue in issues:
         key = issue.get('key')
         fields = issue.get('fields', {})
+        # 作成日時を取得
         created_dt = parse_iso(fields.get('created', ''))
-
         # 初期値
         if field_id == 'status':
             init_val = fields.get('status', {}).get('name')
         else:
             raw = fields.get(field_id)
-            init_val = None
             if isinstance(raw, dict):
                 init_val = raw.get('value') or raw.get('name')
-            elif raw is not None:
+            else:
                 init_val = raw
         events = []
+        # 初期イベントとして作成時刻のステータスを追加
         if created_dt and init_val is not None:
             events.append((created_dt.astimezone(timezone.utc), init_val))
-
-        # changelogからの変更イベント
+        # 履歴イベントを追加
         for hist in fields.get('changelog', {}).get('histories', []):
-            dt = parse_iso(hist.get('created', ''))
-            if not dt:
+            hist_dt = parse_iso(hist.get('created', ''))
+            if not hist_dt:
                 continue
-            dt = dt.astimezone(timezone.utc)
+            hist_dt = hist_dt.astimezone(timezone.utc)
             for item in hist.get('items', []):
                 if item.get('field') == field_id:
-                    events.append((dt, item.get('toString')))
-
-        # ソート
+                    events.append((hist_dt, item.get('toString')))
+        # イベントを時間順にソート
         events.sort(key=lambda x: x[0])
         ticket_events[key] = events
+        if debug:
+            print(f"[DEBUG] {key} events:")
+            for dt, val in events:
+                print(f"    {dt.isoformat()} -> {val}")
 
-    # チケットごとに日付→ステータスマップを作成
-    ticket_date_map = {}
-    for key, events in ticket_events.items():
-        date_map = {}
-        for dt, val in events:
-            date_map[dt.date()] = val
-        ticket_date_map[key] = date_map
-
-    if debug:
-        print("[DEBUG] ticket_date_map:")
-        for key, dm in ticket_date_map.items():
-            print(f"  {key}: {dm}")
-
-    # 集計期間
-    all_dates = set()
-    for dm in ticket_date_map.values():
-        all_dates.update(dm.keys())
-    if not all_dates:
-        print("イベントが見つかりませんでした。JSONに changelog を含めて取得してください。")
+    # 集計期間を決定 (最古の作成日時のdateから今日まで)
+    all_created = [evs[0][0] for evs in ticket_events.values() if evs]
+    if not all_created:
+        print("有効なチケットイベントが見つかりませんでした。JSONに changelog が含まれているか確認してください。")
         return
-    start = min(all_dates)
-    end = datetime.now(timezone.utc).date()
+    start_date = min(all_created).astimezone(timezone.utc).date()
+    end_date = datetime.now(timezone.utc).date()
 
-    # 各チケットの前日のステータス保持用
-    last_status = {key: None for key in ticket_date_map}
-
-    # 日毎集計
+    # 日次でスナップショットを取得しカウント
     date_counts = {}
-    current = start
-    while current <= end:
+    current = start_date
+    while current <= end_date:
+        snapshot = datetime.combine(current, time(0,0), tzinfo=timezone.utc)
         counts = defaultdict(int)
         if debug:
-            print(f"[DEBUG] Snapshot for {current}")
-        for key, dm in ticket_date_map.items():
-            # その日のイベントがあれば更新
-            if current in dm:
-                last_status[key] = dm[current]
-            status = last_status[key]
+            print(f"[DEBUG] Snapshot at {snapshot.isoformat()}")
+        for key, events in ticket_events.items():
+            current_status = None
+            for dt, val in events:
+                if dt <= snapshot:
+                    current_status = val
+                else:
+                    break
             if debug:
-                print(f"  {key} at {current}: {status}")
-            if status is not None:
-                counts[status] += 1
+                print(f"    {key}: {current_status}")
+            if current_status is not None:
+                counts[current_status] += 1
         date_counts[current.strftime('%Y-%m-%d')] = counts
         current += timedelta(days=1)
 
-    # ヘッダー
+    # CSVヘッダー用に全値を収集
     all_vals = sorted({v for cnts in date_counts.values() for v in cnts})
 
     # CSV出力
