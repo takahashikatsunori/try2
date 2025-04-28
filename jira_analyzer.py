@@ -37,9 +37,10 @@ def extract_field_counts(json_path, field_id, debug=False):
             init_val = fields.get('status', {}).get('name')
         else:
             raw = fields.get(field_id)
+            init_val = None
             if isinstance(raw, dict):
                 init_val = raw.get('value') or raw.get('name')
-            else:
+            elif raw is not None:
                 init_val = raw
         events = []
         # 初期イベントとして作成時刻のステータスを追加
@@ -80,13 +81,19 @@ def extract_field_counts(json_path, field_id, debug=False):
             print(f"[DEBUG] Snapshot at {snapshot.isoformat()}")
         for key, events in ticket_events.items():
             current_status = None
+            if debug:
+                print(f"  [DEBUG] Evaluating ticket {key} events:")
             for dt, val in events:
                 if dt <= snapshot:
                     current_status = val
+                    if debug:
+                        print(f"    [DEBUG] Matched event: {dt.isoformat()} -> {val}")
                 else:
+                    if debug:
+                        print(f"    [DEBUG] Skipped event: {dt.isoformat()} (after snapshot)")
                     break
             if debug:
-                print(f"    {key}: {current_status}")
+                print(f"  [DEBUG] {key} status at {snapshot.isoformat()}: {current_status}")
             if current_status is not None:
                 counts[current_status] += 1
         date_counts[current.strftime('%Y-%m-%d')] = counts
